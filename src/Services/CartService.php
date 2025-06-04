@@ -3,11 +3,12 @@ namespace App\Services;
 
 use App\Core\Database;
 use App\Core\Logger;
+use App\Core\Session;
 use App\Exceptions\CartException;
 
 /**
- * Сервис для работы с корзиной
- * Поддерживает гостевые корзины (сессия) и пользовательские (БД)
+ * Исправленный сервис для работы с корзиной
+ * Устраняет проблемы с дублированием сессий и некорректными проверками
  */
 class CartService
 {
@@ -16,15 +17,25 @@ class CartService
     const MAX_QUANTITY = 9999;
     
     /**
-     * Получить корзину
+     * Получить корзину - единая логика для всех случаев
      */
     public static function get(?int $userId = null): array
     {
-        if ($userId > 0) {
-            return self::loadFromDatabase($userId);
+        try {
+            if ($userId > 0) {
+                // Для авторизованных пользователей - только БД
+                return self::loadFromDatabase($userId);
+            } else {
+                // Для гостей - только сессия
+                return self::loadFromSession();
+            }
+        } catch (\Exception $e) {
+            Logger::error('Cart loading error', [
+                'user_id' => $userId,
+                'error' => $e->getMessage()
+            ]);
+            return [];
         }
-        
-        return self::loadFromSession();
     }
     
     /**
@@ -94,7 +105,7 @@ class CartService
                 'product_id' => $productId,
                 'quantity' => $quantity,
                 'added_at' => date('Y-m-d H:i:s'),
-                'city_id' => $cityId // Сохраняем город для отслеживания
+                'city_id' => $cityId
             ];
         }
         
@@ -275,56 +286,14 @@ class CartService
     }
     
     /**
-     * Проверить корзину при смене города
-     */
-    public static function validateCartForCity(int $newCityId, ?int $userId = null): array
-    {
-        $cart = self::get($userId);
-        if (empty($cart)) {
-            return ['valid' => true, 'changes' => []];
-        }
-        
-        $changes = [];
-        $dynamicService = new DynamicProductDataService();
-        $productIds = array_keys($cart);
-        
-        // Получаем данные для нового города
-        $dynamicData = $dynamicService->getProductsDynamicData($productIds, $newCityId, $userId);
-        
-        foreach ($cart as $productId => $item) {
-            $newStock = $dynamicData[$productId]['stock']['quantity'] ?? 0;
-            
-            if ($newStock <= 0) {
-                $changes[] = [
-                    'product_id' => $productId,
-                    'action' => 'remove',
-                    'reason' => 'Товар недоступен в выбранном городе'
-                ];
-            } elseif ($item['quantity'] > $newStock) {
-                $changes[] = [
-                    'product_id' => $productId,
-                    'action' => 'reduce',
-                    'new_quantity' => $newStock,
-                    'reason' => "Доступно только {$newStock} шт"
-                ];
-            }
-        }
-        
-        return [
-            'valid' => empty($changes),
-            'changes' => $changes
-        ];
-    }
-    
-    /**
      * Слияние гостевой корзины с пользовательской
      */
     public static function mergeGuestCartWithUser(int $userId): void
     {
         if ($userId <= 0) return;
         
-        // Проверяем что сессия активна
-        if (session_status() !== PHP_SESSION_ACTIVE) {
+        // Используем новый Session API
+        if (!Session::isActive()) {
             error_log("WARNING: Session not active in mergeGuestCartWithUser");
             return;
         }
@@ -372,6 +341,117 @@ class CartService
     }
     
     // === Приватные методы ===
+    
+    /**
+     * Загрузить корзину из БД
+     */
+    private static function loadFromDatabase(int $userId): array
+    {
+        try {
+            $stmt = Database::query(
+                "SELECT payload FROM carts WHERE user_id = ? LIMIT 1",
+                [$userId]
+            );
+            
+            $row = $stmt->fetch();
+            if ($row && $row['payload']) {
+                $cart = json_decode($row['payload'], true);
+                if (json_last_error() === JSON_ERROR_NONE) {
+                    return $cart;
+                }
+            }
+        } catch (\Exception $e) {
+            Logger::error('Ошибка загрузки корзины из БД', [
+                'user_id' => $userId,
+                'error' => $e->getMessage()
+            ]);
+        }
+        
+        return [];
+    }
+    
+    /**
+     * Загрузить корзину из сессии - используем новый Session API
+     */
+    private static function loadFromSession(): array
+    {
+        try {
+            return Session::get(self::SESSION_KEY, []);
+        } catch (\Exception $e) {
+            Logger::error('Ошибка загрузки корзины из сессии', [
+                'error' => $e->getMessage()
+            ]);
+            return [];
+        }
+    }
+    
+    /**
+     * Сохранить корзину
+     */
+    private static function save(array $cart, ?int $userId = null): void
+    {
+        if ($userId > 0) {
+            // Для авторизованных - только в БД
+            self::saveToDatabase($userId, $cart);
+        } else {
+            // Для гостей - только в сессию
+            self::saveToSession($cart);
+        }
+    }
+    
+    /**
+     * Сохранить в БД
+     */
+    private static function saveToDatabase(int $userId, array $cart): void
+    {
+        try {
+            $payload = json_encode($cart, JSON_UNESCAPED_UNICODE);
+            
+            Database::query(
+                "INSERT INTO carts (user_id, payload, created_at, updated_at)
+                 VALUES (?, ?, NOW(), NOW())
+                 ON DUPLICATE KEY UPDATE 
+                 payload = VALUES(payload),
+                 updated_at = NOW()",
+                [$userId, $payload]
+            );
+        } catch (\Exception $e) {
+            Logger::error('Ошибка сохранения корзины в БД', [
+                'user_id' => $userId,
+                'error' => $e->getMessage()
+            ]);
+            throw new CartException('Не удалось сохранить корзину');
+        }
+    }
+    
+    /**
+     * Сохранить в сессию - используем новый Session API
+     */
+    private static function saveToSession(array $cart): void
+    {
+        try {
+            Session::set(self::SESSION_KEY, $cart);
+        } catch (\Exception $e) {
+            Logger::error('Ошибка сохранения корзины в сессию', [
+                'error' => $e->getMessage()
+            ]);
+            throw new CartException('Не удалось сохранить корзину');
+        }
+    }
+    
+    /**
+     * Очистить сессию - используем новый Session API
+     */
+    private static function clearSession(): void
+    {
+        try {
+            Session::remove(self::SESSION_KEY);
+        } catch (\Exception $e) {
+            Logger::error('Ошибка очистки корзины в сессии', [
+                'error' => $e->getMessage()
+            ]);
+        }
+    }
     
     /**
      * Получить информацию о товаре
@@ -430,7 +510,7 @@ class CartService
     }
     
     /**
-     * Получить текущий город
+     * Получить текущий город из сессии/cookie
      */
     private static function getCurrentCityId(): int
     {
@@ -439,8 +519,11 @@ class CartService
             return (int)$_COOKIE['selected_city_id'];
         }
         
-        if (isset($_SESSION['city_id'])) {
-            return (int)$_SESSION['city_id'];
+        if (Session::isActive()) {
+            $cityId = Session::get('city_id');
+            if ($cityId) {
+                return (int)$cityId;
+            }
         }
         
         return 1; // Москва по умолчанию
@@ -498,114 +581,5 @@ class CartService
             'discount' => 0,
             'total' => 0
         ];
-    }
-    
-    /**
-     * Загрузить корзину из БД
-     */
-    private static function loadFromDatabase(int $userId): array
-    {
-        try {
-            $stmt = Database::query(
-                "SELECT payload FROM carts WHERE user_id = ? LIMIT 1",
-                [$userId]
-            );
-            
-            $row = $stmt->fetch();
-            if ($row && $row['payload']) {
-                $cart = json_decode($row['payload'], true);
-                if (json_last_error() === JSON_ERROR_NONE) {
-                    return $cart;
-                }
-            }
-        } catch (\Exception $e) {
-            Logger::error('Ошибка загрузки корзины из БД', [
-                'user_id' => $userId,
-                'error' => $e->getMessage()
-            ]);
-        }
-        
-        return [];
-    }
-    
-    /**
-     * Загрузить корзину из сессии
-     */
-    private static function loadFromSession(): array
-    {
-        // НЕ вызываем session_start() - сессия уже запущена через Bootstrap
-        if (session_status() !== PHP_SESSION_ACTIVE) {
-            error_log("WARNING: Session not active in CartService::loadFromSession()");
-            return [];
-        }
-        
-        return $_SESSION[self::SESSION_KEY] ?? [];
-    }
-    
-    /**
-     * Сохранить корзину
-     */
-    private static function save(array $cart, ?int $userId = null): void
-    {
-        if ($userId > 0) {
-            self::saveToDatabase($userId, $cart);
-        }
-        
-        self::saveToSession($cart);
-    }
-    
-    /**
-     * Сохранить в БД
-     */
-    private static function saveToDatabase(int $userId, array $cart): void
-    {
-        try {
-            $payload = json_encode($cart, JSON_UNESCAPED_UNICODE);
-            
-            Database::query(
-                "INSERT INTO carts (user_id, payload, created_at, updated_at)
-                 VALUES (?, ?, NOW(), NOW())
-                 ON DUPLICATE KEY UPDATE 
-                 payload = VALUES(payload),
-                 updated_at = NOW()",
-                [$userId, $payload]
-            );
-        } catch (\Exception $e) {
-            Logger::error('Ошибка сохранения корзины в БД', [
-                'user_id' => $userId,
-                'error' => $e->getMessage()
-            ]);
-            throw new CartException('Не удалось сохранить корзину');
-        }
-    }
-    
-    /**
-     * Сохранить в сессию
-     */
-    private static function saveToSession(array $cart): void
-    {
-        // НЕ вызываем session_start() - сессия уже запущена через Bootstrap
-        if (session_status() !== PHP_SESSION_ACTIVE) {
-            error_log("ERROR: Session not active in CartService::saveToSession()");
-            throw new CartException('Session not initialized');
-        }
-        
-        $_SESSION[self::SESSION_KEY] = $cart;
-        // НЕ вызываем session_write_close() - это может прервать сессию для других компонентов
-    }
-    
-    /**
-     * Очистить сессию
-     */
-    private static function clearSession(): void
-    {
-        // НЕ вызываем session_start() - сессия уже запущена через Bootstrap
-        if (session_status() !== PHP_SESSION_ACTIVE) {
-            error_log("ERROR: Session not active in CartService::clearSession()");
-            return;
-        }
-        
-        unset($_SESSION[self::SESSION_KEY]);
-        // НЕ вызываем session_write_close() - это может прервать сессию для других компонентов
     }
 }

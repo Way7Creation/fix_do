@@ -3,7 +3,7 @@ namespace App\Core;
 
 /**
  * Безопасный менеджер конфигурации
- * Загружает настройки из защищенной директории
+ * ИСПРАВЛЕННАЯ ВЕРСИЯ - без хардкода паролей
  */
 class Config
 {
@@ -13,9 +13,6 @@ class Config
 
     /**
      * Получить значение конфигурации
-     * @param string $key Ключ в формате 'section.key' или 'key'
-     * @param mixed $default Значение по умолчанию
-     * @return mixed
      */
     public static function get(string $key, $default = null)
     {
@@ -56,61 +53,16 @@ class Config
     }
 
     /**
-     * Загрузка конфигурации из безопасной директории
+     * Загрузка конфигурации ТОЛЬКО из внешних файлов
      */
-    private static function load(): void
+    public static function load(): void
     {
         try {
-            // Проверяем пути конфигурации в порядке приоритета
-            $configPaths = [
-                '/var/www/config/vdestor',    // Новый путь для PHP
-                '/etc/vdestor/config',         // Основной путь
-                $_ENV['CONFIG_PATH'] ?? null,
-                dirname(__DIR__, 2) . '/config',
-                dirname(__DIR__, 2) . '/.config'
-            ];
-            
-            self::$configPath = null;
-            foreach (array_filter($configPaths) as $path) {
-                if (is_dir($path) && is_readable($path)) {
-                    self::$configPath = $path;
-                    break;
-                }
-            }
+            // Определяем путь к конфигурации
+            self::$configPath = self::findConfigPath();
             
             if (!self::$configPath) {
-                error_log("Config directory not found, using defaults");
-                // Используем дефолтную конфигурацию из ваших данных
-                self::$config = [
-                    'database' => [
-                        'mysql' => [
-                            'host' => 'localhost',
-                            'user' => 'adminkjg', // из ваших данных
-                            'password' => 'adQw67Ffl', // из ваших данных 
-                            'database' => 'magellanjg', // из ваших данных
-                            'charset' => 'utf8mb4',
-                            'port' => 3306
-                        ]
-                    ],
-                    'app' => [
-                        'name' => 'VDE Store',
-                        'debug' => false,
-                        'url' => 'https://vdestor.ru',
-                        'timezone' => 'Europe/Moscow'
-                    ],
-                    'session' => [
-                        'save_handler' => 'db',
-                        'gc_maxlifetime' => 1800,
-                        'cookie_secure' => true,
-                        'cookie_httponly' => true,
-                        'cookie_samesite' => 'Lax',
-                        'name' => 'VDE_SESSION',
-                        'table' => 'sessions',
-                        'regenerate_interval' => 1800
-                    ]
-                ];
-                self::$loaded = true;
-                return;
+                throw new \RuntimeException("Configuration directory not found. Please check paths.");
             }
             
             // Загружаем .env файл первым
@@ -122,25 +74,36 @@ class Config
             // Заменяем переменные окружения в конфигах
             self::$config = self::replaceEnvironmentVariables(self::$config);
             
+            // Валидируем обязательные параметры
+            self::validateRequiredConfig();
+            
             self::$loaded = true;
             
         } catch (\Exception $e) {
             error_log("Configuration loading failed: " . $e->getMessage());
-            // Используем дефолтную конфигурацию при ошибке
-            self::$config = [
-                'database' => [
-                    'mysql' => [
-                        'host' => 'localhost',
-                        'user' => 'adminkjg',
-                        'password' => 'adQw67Ffl',
-                        'database' => 'magellanjg',
-                        'charset' => 'utf8mb4',
-                        'port' => 3306
-                    ]
-                ]
-            ];
-            self::$loaded = true;
+            throw new \RuntimeException("Cannot start application without configuration: " . $e->getMessage());
         }
+    }
+
+    /**
+     * Поиск директории конфигурации
+     */
+    private static function findConfigPath(): ?string
+    {
+        $configPaths = [
+            '/etc/vdestor/config',         // Основной путь для продакшена
+            '/var/www/config/vdestor',     // Альтернативный путь
+            $_ENV['CONFIG_PATH'] ?? null,  // Переменная окружения
+            dirname(__DIR__, 2) . '/config',  // Локальная разработка
+        ];
+        
+        foreach (array_filter($configPaths) as $path) {
+            if (is_dir($path) && is_readable($path)) {
+                return $path;
+            }
+        }
+        
+        return null;
     }
 
     /**
@@ -213,6 +176,30 @@ class Config
     }
 
     /**
+     * Валидация обязательных параметров конфигурации
+     */
+    private static function validateRequiredConfig(): void
+    {
+        $required = [
+            'database.mysql.host',
+            'database.mysql.user', 
+            'database.mysql.password',
+            'database.mysql.database'
+        ];
+
+        $missing = [];
+        foreach ($required as $key) {
+            if (!self::has($key)) {
+                $missing[] = $key;
+            }
+        }
+
+        if (!empty($missing)) {
+            throw new \RuntimeException("Missing required configuration: " . implode(', ', $missing));
+        }
+    }
+
+    /**
      * Получить путь к директории конфигурации
      */
     public static function getConfigPath(): ?string
@@ -234,7 +221,7 @@ class Config
         $configPath = self::getConfigPath();
         if ($configPath && is_readable($configPath)) {
             $perms = fileperms($configPath) & 0777;
-            if ($perms > 0700) {
+            if ($perms > 0750) {
                 $issues[] = "Configuration directory has too permissive rights: " . decoct($perms);
             }
         }
@@ -254,5 +241,20 @@ class Config
         }
 
         return $issues;
+    }
+
+    /**
+     * Получить конфигурацию для подключения к БД
+     */
+    public static function getDatabaseConfig(): array
+    {
+        return [
+            'host' => self::get('database.mysql.host'),
+            'port' => self::get('database.mysql.port', 3306),
+            'user' => self::get('database.mysql.user'),
+            'password' => self::get('database.mysql.password'),
+            'database' => self::get('database.mysql.database'),
+            'charset' => self::get('database.mysql.charset', 'utf8mb4')
+        ];
     }
 }
