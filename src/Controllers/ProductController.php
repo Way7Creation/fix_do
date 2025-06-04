@@ -8,15 +8,18 @@ use App\Services\DynamicProductDataService;
 use App\Services\AuthService;
 use App\Services\SearchService;
 
-class ProductController
+class ProductController extends BaseController
 {
     /**
      * Просмотр одного товара с динамической загрузкой данных
+     * Обрабатывает как /shop/product?id=123 так и /shop/product/123
      */
-    public function viewAction()
+    public function viewAction(?string $id = null): void
     {
-        $id = $_GET['id'] ?? null;
-        if (!$id) {
+        // 🔧 ИСПРАВЛЕНО: Получаем ID из URL параметра или из GET
+        $productId = $id ?? $_GET['id'] ?? null;
+        
+        if (!$productId) {
             $this->show404();
             return;
         }
@@ -32,7 +35,7 @@ class ProductController
             WHERE p.product_id = :id OR p.external_id = :id
             LIMIT 1
         ");
-        $stmt->execute(['id' => $id]);
+        $stmt->execute(['id' => $productId]);
         $product = $stmt->fetch();
         
         if (!$product) {
@@ -40,21 +43,21 @@ class ProductController
             return;
         }
         
-        $productId = $product['product_id'];
+        $productIdNum = (int)$product['product_id'];
         
         // 2. Получаем дополнительные статические данные
-        $images = $this->getProductImages($productId);
-        $documents = $this->getProductDocuments($productId);
-        $attributes = $this->getProductAttributes($productId);
-        $related = $this->getRelatedProducts($productId);
+        $images = $this->getProductImages($productIdNum);
+        $documents = $this->getProductDocuments($productIdNum);
+        $attributes = $this->getProductAttributes($productIdNum);
+        $related = $this->getRelatedProducts($productIdNum);
         
         // 3. Получаем динамические данные (цены, остатки, доставка)
         $cityId = (int)($_COOKIE['selected_city_id'] ?? $_SESSION['city_id'] ?? 1);
         $userId = AuthService::check() ? AuthService::user()['id'] : null;
         
         $dynamicService = new DynamicProductDataService();
-        $dynamicData = $dynamicService->getProductsDynamicData([$productId], $cityId, $userId);
-        $productDynamic = $dynamicData[$productId] ?? [];
+        $dynamicData = $dynamicService->getProductsDynamicData([$productIdNum], $cityId, $userId);
+        $productDynamic = $dynamicData[$productIdNum] ?? [];
         
         // 4. Извлекаем данные для передачи в view
         $price = $productDynamic['price']['final'] ?? null;
@@ -65,7 +68,7 @@ class ProductController
         $deliveryInfo = $productDynamic['delivery'] ?? ['text' => 'Уточняйте'];
         
         // 5. Логируем просмотр товара для аналитики
-        $this->logProductView($productId, $userId);
+        $this->logProductView($productIdNum, $userId);
         
         // 6. Передаем все данные в view
         Layout::render('shop/product', [
@@ -184,31 +187,34 @@ class ProductController
     /**
      * AJAX endpoint для динамического обновления данных о товаре
      */
-    public function ajaxProductInfoAction(): void
+    public function ajaxProductInfoAction(?string $id = null): void
     {
         header('Content-Type: application/json; charset=utf-8');
         
-        $productId = (int)($_GET['id'] ?? 0);
-        $cityId = (int)($_GET['city_id'] ?? 1);
-        
-        if ($productId <= 0) {
-            $this->jsonResponse(['success' => false, 'error' => 'Invalid product ID']);
-            return;
-        }
-        
-        $userId = AuthService::check() ? AuthService::user()['id'] : null;
-        
         try {
+            $productId = (int)($id ?? $_GET['id'] ?? 0);
+            $cityId = (int)($_GET['city_id'] ?? 1);
+            
+            if ($productId <= 0) {
+                $this->error('Некорректный ID товара', 400);
+                return;
+            }
+            
+            $userId = AuthService::check() ? AuthService::user()['id'] : null;
+            
             $dynamicService = new DynamicProductDataService();
             $dynamicData = $dynamicService->getProductsDynamicData([$productId], $cityId, $userId);
             
-            $this->jsonResponse([
-                'success' => true,
-                'data' => $dynamicData[$productId] ?? []
-            ]);
+            // ✅ Унифицированный успешный ответ
+            $this->success([
+                'product_data' => $dynamicData[$productId] ?? [],
+                'city_id' => $cityId,
+                'timestamp' => time()
+            ], 'Данные товара получены');
+            
         } catch (\Exception $e) {
             Logger::error('Failed to get product info', ['error' => $e->getMessage()]);
-            $this->jsonResponse(['success' => false, 'error' => 'Server error']);
+            $this->error('Ошибка получения данных товара', 500);
         }
     }
     
@@ -251,16 +257,8 @@ class ProductController
             'query' => $query,
             'total' => $result['data']['total'] ?? 0,
             'currentPage' => $params['page'],
-            'totalPages' => ceil(($result['data']['total'] ?? 0) / $params['limit'])
+            'totalPages' => ceil(($result['data']['total'] ?? 0) / $params['limit']),
+            'debug' => $result['data']['debug'] ?? []
         ]);
-    }
-    
-    /**
-     * Вспомогательный метод для JSON ответов
-     */
-    private function jsonResponse(array $data): void
-    {
-        echo json_encode($data, JSON_UNESCAPED_UNICODE);
-        exit;
     }
 }
